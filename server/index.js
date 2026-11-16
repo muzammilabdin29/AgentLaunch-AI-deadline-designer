@@ -28,6 +28,7 @@ const schema = {
 };
 
 const rateCounters = new Map();
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 app.disable('x-powered-by');
 app.use(express.json({ limit: '16kb' }));
@@ -41,6 +42,44 @@ function validDate(value) {
   const [y, m, d] = value.split('-').map(Number);
   const parsed = new Date(Date.UTC(y, m - 1, d));
   return parsed.getUTCFullYear() === y && parsed.getUTCMonth() === m - 1 && parsed.getUTCDate() === d;
+}
+
+async function executeGeminiCall(ai, modelName, prompt, systemInstruction, jsonSchema) {
+  // 1. Try Interactions API first (Google's recommendation for Gemini 3)
+  try {
+    const interaction = await ai.interactions.create({
+      model: modelName,
+      system_instruction: systemInstruction,
+      input: prompt,
+      response_format: {
+        type: 'text',
+        mime_type: 'application/json',
+        schema: jsonSchema
+      }
+    });
+    if (interaction.output_text) {
+      return { text: interaction.output_text, method: 'interactions' };
+    }
+  } catch (interactionError) {
+    // If not a 503 overload, attempt models.generateContent fallback
+    if (!String(interactionError.message).includes('503')) {
+      console.warn(`Interactions API on ${modelName} returned non-503 error, trying generateContent:`, interactionError.message);
+    } else {
+      throw interactionError; // Propagate 503 so retry/fallback handles it
+    }
+  }
+
+  // 2. Fallback to models.generateContent
+  const response = await ai.models.generateContent({
+    model: modelName,
+    contents: prompt,
+    config: {
+      systemInstruction,
+      responseMimeType: 'application/json',
+      responseSchema: jsonSchema
+    }
+  });
+  return { text: response.text, method: 'generateContent' };
 }
 
 app.post('/api/milestones', async (req, res) => {
@@ -62,47 +101,51 @@ app.post('/api/milestones', async (req, res) => {
     return res.status(503).json({ error: 'AI is not configured. Add GEMINI_API_KEY to your environment variables. You can still use starter milestones.' });
   }
 
-  const model = process.env.GEMINI_MODEL?.trim() || 'gemini-3.8-flash';
   const prompt = `Plan five milestones for this goal:\n${goal.trim()}\nToday: ${today}\nDeadline: ${deadline}\nVisual style: ${vibe}. Every milestone date must be YYYY-MM-DD, be between today and deadline inclusive, in chronological order; the final milestone date must be ${deadline}.`;
   const systemInstruction = 'You are an expert goal-planning assistant. Return only valid JSON with an array named "milestones" containing exactly 5 items. Each item must have "title" (3 to 7 words, max 45 characters) and "date" (formatted YYYY-MM-DD). Milestones must progress chronologically ending on the deadline. No markdown fences, no explanatory text.';
+
+  const configuredModel = process.env.GEMINI_MODEL?.trim() || 'gemini-3.8-flash';
+  // If configured model is busy (503), fall back to gemini-3.5-flash-lite
+  const modelCandidates = [
+    configuredModel,
+    'gemini-3.5-flash-lite',
+    'gemini-3.8-flash'
+  ].filter((m, i, arr) => m && arr.indexOf(m) === i);
 
   try {
     const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
     let responseText = null;
-    let usedMethod = 'interactions';
+    let successfulModel = null;
+    let lastError = null;
 
-    // 1. Primary: Use Interactions API with gemini-3.8-flash (Recommended by Google)
-    try {
-      const interaction = await ai.interactions.create({
-        model,
-        system_instruction: systemInstruction,
-        input: prompt,
-        response_format: {
-          type: 'text',
-          mime_type: 'application/json',
-          schema
+    for (const currentModel of modelCandidates) {
+      for (let attempt = 1; attempt <= 2; attempt++) {
+        try {
+          const result = await executeGeminiCall(ai, currentModel, prompt, systemInstruction, schema);
+          if (result && result.text) {
+            responseText = result.text;
+            successfulModel = currentModel;
+            break;
+          }
+        } catch (err) {
+          lastError = err;
+          const isHighDemand = String(err.message).includes('503') || err.status === 503;
+          console.warn(`Model ${currentModel} (Attempt ${attempt}/2) failed:`, err.message);
+
+          if (isHighDemand && attempt === 1) {
+            // Wait 1.5 seconds and retry the same model
+            await sleep(1500);
+            continue;
+          }
+          // Break to try next model in candidate list
+          break;
         }
-      });
-      responseText = interaction.output_text;
-    } catch (interactionError) {
-      console.warn('Interactions API call failed, attempting models.generateContent fallback:', interactionError.message);
-      
-      // 2. Fallback: models.generateContent
-      const response = await ai.models.generateContent({
-        model,
-        contents: prompt,
-        config: {
-          systemInstruction,
-          responseMimeType: 'application/json',
-          responseSchema: schema
-        }
-      });
-      responseText = response.text;
-      usedMethod = 'generateContent';
+      }
+      if (responseText) break;
     }
 
     if (!responseText) {
-      throw new Error('Empty response received from Gemini API');
+      throw lastError || new Error('No response received from Gemini API');
     }
 
     const cleanJson = responseText.trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '');
@@ -129,7 +172,7 @@ app.post('/api/milestones', async (req, res) => {
     }
 
     milestones[milestones.length - 1].date = deadline;
-    res.json({ milestones, source: 'gemini', method: usedMethod });
+    res.json({ milestones, source: 'gemini', model: successfulModel });
   } catch (error) {
     console.error('Gemini API generation failed:', error);
     res.status(502).json({
