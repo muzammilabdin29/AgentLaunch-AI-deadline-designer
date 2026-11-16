@@ -10,27 +10,40 @@ if (!key) {
     process.exit(1);
 }
 
-try {
-    const ai = new GoogleGenAI({ apiKey: key });
+const ai = new GoogleGenAI({ apiKey: key });
 
+console.log("\n--- Step 1: Listing Available Models for Your Key ---");
+let candidateModel = process.env.GEMINI_MODEL || "gemini-2.0-flash";
+
+try {
+    const pager = await ai.models.list({ config: { pageSize: 50 } });
+    const models = [];
+    for await (const m of pager) {
+        if (m.name && (!m.supportedActions || m.supportedActions.includes("generateContent"))) {
+            models.push(m.name);
+        }
+    }
+    console.log(`Found ${models.length} model(s) that support generateContent:`);
+    models.slice(0, 10).forEach(m => console.log(`  - ${m}`));
+    if (models.length > 10) console.log(`  ... and ${models.length - 10} more`);
+
+    if (models.length > 0) {
+        candidateModel = models.find(m => m.includes("flash")) || models[0];
+    }
+} catch (listErr) {
+    console.warn("Could not list models:", listErr.message);
+}
+
+console.log(`\n--- Step 2: Testing Generation with Model: ${candidateModel} ---`);
+try {
     const response = await ai.models.generateContent({
-        model: process.env.GEMINI_MODEL || "gemini-2.5-flash",
+        model: candidateModel,
         contents: "Reply with only OK"
     });
 
-    console.log("Gemini connection: SUCCESS");
+    console.log("Gemini connection: SUCCESS 🎉");
     console.log("Response:", response.text);
 } catch (error) {
-    const status = error.status ?? "unknown";
-    console.log("Gemini connection: FAILED");
-    console.log("Error details:", error.message);
-    console.log("HTTP status:", status);
-    console.log(
-        "Likely cause:",
-        status === 401 ? "Authentication rejected (check API key)" :
-            status === 403 ? "Permission or project access" :
-                status === 429 ? "Rate limit or quota exceeded" :
-                    status === 404 ? "Model not found on your tier" :
-                        "Check backend error details"
-    );
+    console.error("Gemini connection: FAILED ❌");
+    console.error("Error details:", error.message);
 }

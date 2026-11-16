@@ -36,6 +36,28 @@ app.get('/api/health', (_, res) => {
   res.json({ ok: true, aiReady: Boolean(process.env.GEMINI_API_KEY) });
 });
 
+// Diagnostic endpoint to view all models supported by the current key
+app.get('/api/models', async (_, res) => {
+  if (!process.env.GEMINI_API_KEY) {
+    return res.status(503).json({ error: 'GEMINI_API_KEY is not set.' });
+  }
+  try {
+    const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+    const pager = await ai.models.list({ config: { pageSize: 100 } });
+    const models = [];
+    for await (const m of pager) {
+      models.push({
+        name: m.name,
+        displayName: m.displayName,
+        supportedActions: m.supportedActions
+      });
+    }
+    res.json({ count: models.length, models });
+  } catch (err) {
+    res.status(500).json({ error: err.message, status: err.status });
+  }
+});
+
 function validDate(value) {
   if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
   const [y, m, d] = value.split('-').map(Number);
@@ -65,17 +87,56 @@ app.post('/api/milestones', async (req, res) => {
   try {
     const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
     const userModel = process.env.GEMINI_MODEL?.trim();
-    const candidateModels = [
-      userModel,
-      'gemini-2.5-flash',
-      'gemini-2.0-flash',
-      'gemini-1.5-flash'
-    ].filter((m, i, arr) => m && arr.indexOf(m) === i);
+    let candidateModels = [];
+    if (userModel) candidateModels.push(userModel);
+
+    // Auto-discover models supported by this specific key
+    try {
+      const pager = await ai.models.list({ config: { pageSize: 50 } });
+      const discovered = [];
+      for await (const m of pager) {
+        if (m.name && (!m.supportedActions || m.supportedActions.includes('generateContent'))) {
+          discovered.push(m.name);
+        }
+      }
+
+      if (discovered.length > 0) {
+        // If user specified a model, check if it matches
+        const matched = userModel
+          ? discovered.find(m => m === userModel || m === `models/${userModel}` || m.endsWith(userModel))
+          : null;
+
+        if (matched) {
+          candidateModels = [matched];
+        } else {
+          // Prioritize flash models, then any gemini model
+          const flash = discovered.find(m => m.includes('flash') && !m.includes('thinking'));
+          if (flash && !candidateModels.includes(flash)) candidateModels.push(flash);
+          for (const m of discovered) {
+            if (!candidateModels.includes(m)) candidateModels.push(m);
+          }
+        }
+      }
+    } catch (listErr) {
+      console.warn('Could not auto-list models, using fallback list:', listErr.message);
+    }
+
+    if (candidateModels.length === 0) {
+      candidateModels = [
+        userModel,
+        'gemini-2.0-flash',
+        'gemini-2.0-flash-exp',
+        'gemini-1.5-flash-latest',
+        'gemini-1.5-flash',
+        'gemini-2.5-flash'
+      ].filter(Boolean);
+    }
 
     const prompt = `Plan five milestones for this goal:\n${goal.trim()}\nToday: ${today}\nDeadline: ${deadline}\nVisual style: ${vibe}. Every milestone date must be YYYY-MM-DD, be between today and deadline inclusive, in chronological order; the final milestone date must be ${deadline}.`;
     const systemInstruction = 'You are an expert goal-planning assistant. Return only valid JSON with an array named "milestones" containing exactly 5 items. Each item must have "title" (3 to 7 words, max 45 characters) and "date" (formatted YYYY-MM-DD). Milestones must progress chronologically ending on the deadline. No markdown fences, no explanatory text.';
 
     let responseText = null;
+    let usedModel = null;
     let lastError = null;
 
     for (const model of candidateModels) {
@@ -90,7 +151,10 @@ app.post('/api/milestones', async (req, res) => {
           }
         });
         responseText = response.text;
-        if (responseText) break;
+        if (responseText) {
+          usedModel = model;
+          break;
+        }
       } catch (err) {
         lastError = err;
         console.warn(`Gemini generation with model "${model}" failed:`, err.message);
@@ -125,7 +189,7 @@ app.post('/api/milestones', async (req, res) => {
     }
 
     milestones[milestones.length - 1].date = deadline;
-    res.json({ milestones, source: 'gemini' });
+    res.json({ milestones, source: 'gemini', model: usedModel });
   } catch (error) {
     console.error('Gemini API generation failed:', error);
     res.status(502).json({
